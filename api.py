@@ -9,9 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from orchestrator.chatbot import process_chat_question
-from rag.pipeline import build_collection
-
 load_dotenv()
 
 app = FastAPI(title="FinPilot AI Backend API")
@@ -27,8 +24,25 @@ app.add_middleware(
 TEMP_UPLOADS_ROOT = "temp_uploads"
 os.makedirs(TEMP_UPLOADS_ROOT, exist_ok=True)
 
+# Lazy imports — loaded only when first request comes in, not at startup
+_chatbot = None
+_build_collection = None
+
+def get_chatbot():
+    global _chatbot
+    if _chatbot is None:
+        from orchestrator.chatbot import process_chat_question
+        _chatbot = process_chat_question
+    return _chatbot
+
+def get_build_collection():
+    global _build_collection
+    if _build_collection is None:
+        from rag.pipeline import build_collection
+        _build_collection = build_collection
+    return _build_collection
+
 # Store user sessions and their uploaded documents
-# Each session keeps track of uploaded files, data sheets, and analysis history
 SESSION_STATE = {}
 
 def get_session(session_id: str):
@@ -47,19 +61,18 @@ class ChatRequest(BaseModel):
 class ClearRequest(BaseModel):
     session_id: str
 
+@app.get("/")
+def health_check():
+    return {"status": "FinPilot AI is running"}
+
 @app.post("/api/upload")
 async def upload_documents(
     session_id: str = Form(...),
     collection: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    """
-    Upload your financial documents, reports, and data files for intelligent analysis.
-    Your files are securely stored and ready to be analyzed by our specialist agents.
-    """
     state = get_session(session_id)
     
-    # Map React's 'financial' back to Python's 'financial_reports'
     collection_map = {
         "financial": "financial_reports",
         "sales": "sales_reports",
@@ -97,10 +110,10 @@ async def upload_documents(
                 state["uploaded_collections"][target_col].append(filename)
                 
     if has_pdf:
-        # Process and index your documents so they're ready for analysis
         try:
             print(f"[API] Building collection {target_col} for session {session_id}...")
-            build_collection(target_col, session_id=session_id)
+            build_col = get_build_collection()
+            build_col(target_col, session_id=session_id)
         except Exception as e:
             if "already exists" not in str(e).lower() and "ephemeral" not in str(e).lower():
                 print(f"[API] Expected RAG warning/error: {e}")
@@ -109,30 +122,24 @@ async def upload_documents(
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """
-    Ask your intelligent assistant anything about your financial data.
-    Get instant insights, recommendations, and analysis powered by AI specialists.
-    """
     state = get_session(req.session_id)
     
     try:
-        # Connect your query to the right specialist to answer your question
+        process_chat_question = get_chatbot()
         result = process_chat_question(
             question=req.query,
             financial_csv=state.get("financial_csv"),
             sales_csv=state.get("sales_csv"),
-            financial_column_mapping=None,  # let it auto-detect
-            sales_column_mapping=None,      # let it auto-detect
+            financial_column_mapping=None,
+            sales_column_mapping=None,
             previous_agents=None, 
             uploaded_collections=state.get("uploaded_collections")
         )
         
-        # Prepare charts and visualizations for your results
         vis_payload = None
         if result.get("visualization_data"):
             vis_payload = {}
             for agent, fig in result["visualization_data"].items():
-                # Format visual insights for display
                 try:
                     vis_payload[agent] = json.loads(fig.to_json())
                 except Exception as e:
@@ -151,10 +158,6 @@ async def chat(req: ChatRequest):
 
 @app.post("/api/clear")
 async def clear_session(req: ClearRequest):
-    """
-    Start fresh with a new analysis session.
-    Remove all previous documents and start analyzing new data.
-    """
     session_id = req.session_id
     if session_id in SESSION_STATE:
         del SESSION_STATE[session_id]
@@ -163,16 +166,5 @@ async def clear_session(req: ClearRequest):
     if os.path.exists(session_temp_folder):
         shutil.rmtree(session_temp_folder)
         
-    # Clean up files from this session to free up space and reset state
-    
     return {"status": "cleared"}
 
-if __name__ == "__main__":
-    import uvicorn
-    # Initialize the system so it's ready to serve your analysis requests
-    try:
-        build_collection("routing_rules")
-    except Exception as e:
-        print("[API Start] System initialization log:", e)
-        
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
